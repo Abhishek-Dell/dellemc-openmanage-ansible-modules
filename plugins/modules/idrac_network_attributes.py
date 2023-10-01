@@ -236,6 +236,7 @@ from ansible_collections.dellemc.openmanage.plugins.module_utils.idrac_redfish i
 from ansible_collections.dellemc.openmanage.plugins.module_utils.utils import remove_key
 from ansible.module_utils.six.moves.urllib.error import URLError, HTTPError
 from ansible.module_utils.urls import ConnectionError, SSLValidationError
+from ansible.module_utils.compat.version import LooseVersion
 
 
 SYSTEMS_URI = "/redfish/v1/Systems"
@@ -247,6 +248,7 @@ OEM_GET_NETWORK_ATTR_URI = "/redfish/v1/Chassis/{resource_id}/NetworkAdapters/{n
 OEM_PATCH_NETWORK_SETTINGS_URI = "/redfish/v1/Chassis/{resource_id}/NetworkAdapters/{network_adapter_id}/NetworkDeviceFunctions/{network_device_function_id}/Oem/Dell/DellNetworkAttributes/{network_device_function_id}/Settings"
 OEM_SCHEMA_NETWORK_SETTINGS_FOR_IDRAC_FW_VER_GREATER_AND_EQ_TO_6000000_URI = "/redfish/v1/Registries/NetworkAttributesRegistry_{network_device_function_id}/NetworkAttributesRegistry_{network_device_function_id}.json"
 OEM_SCHEMA_NETWORK_SETTINGS_FOR_IDRAC_FW_VER_LESSER_TO_6000000_URI = "/redfish/v1/Registries/NetworkAttributesRegistry/NetworkAttributesRegistry.json"
+GET_IDRAC_FIRMWARE_VER_URI = "/redfish/v1/Managers/iDRAC.Embedded.1?$select=FirmwareVersion"
 
 SUCCESS_MSG = "Successfully updated the network attributes."
 PENDING_MSG = "Successfully cleared the pending network attributes."
@@ -259,7 +261,6 @@ INVALID_ATTR_MSG = "Unable to update the network attributes because invalid valu
 VALID_AND_INVALID_ATTR_MSG = "Successfully updated the network attributes for valid values. Unable to update other attributes because invalid values are entered. Enter the valid values and retry the operation."
 NO_CHANGES_FOUND_MSG = "No changes found to be applied."
 CHANGES_FOUND_MSG = "Changes found to be applied."
-
 NETWORK_INVALID_MSG = "{0} is not valid."
 
 class IDRACNetworkAttributes:
@@ -289,25 +290,105 @@ class IDRACNetworkAttributes:
             data, id_or_msg = self.__validate_id(self.module.params.get('network_device_function_id'),
                                            GET_NETWORK_DEVICE_FUNC_URI.format(resource_id=self.resource_id,
                                                                               network_adapter_id=id_or_msg))
-        if not data:
+        else:
             self.module.exit_json(msg=id_or_msg)
 
-    def get_attributes_and_validate(self, uri):
+    def get_attributes(self, uri):
         attributes = self.idrac.invoke_request(method='GET', uri=uri)
-        filter_attributes = remove_key(attributes.json_data, regex_pattern='(.*)@odata')
-        return filter_attributes
-
+        return attributes.json_data
 
 class OEMNetworkAttributes(IDRACNetworkAttributes):
     def __init__(self, idrac, module) -> None:
         super().__init__(idrac, module)
         self.perform_validation_for_ids()
 
+    def __get_idrac_firmware_version(self) -> str:
+        firm_version = self.idrac.invoke_request(method='GET', uri=GET_IDRAC_FIRMWARE_VER_URI)
+        return firm_version.json_data.get('FirmwareVersion', '')
+
+    def __validate_enumeration_registry(self, searching_value, value_dict) -> bool:
+        found = False
+        for val in value_dict.get("Value", []):
+            if searching_value == val.get("ValueDisplayName"):
+                found = True
+                break
+        return found
+
+    def __validate_integer_registry(self, check_attr, value_dict, module_input) -> tuple[bool, str]:
+        try:
+            i = int(module_input.get(check_attr))
+        except ValueError:
+            return False, "Not a valid integer."
+        if not (value_dict.get("LowerBound") <= i <= value_dict.get("UpperBound")):
+            return False, "Integer out of valid range."
+        return True, ''
+
+    def __validate_with_registry(self, check_attr, reg, module_input) -> dict:
+        invalid = {}
+        registry_value = reg[check_attr]
+        if registry_value.get("ReadOnly"):
+            invalid.update({check_attr: "Read only Attribute cannot be modified."})
+        else:
+            data_type = registry_value.get("Type")
+            if data_type == "Enumeration" and not self.__validate_enumeration_registry(check_attr, registry_value):
+                invalid.update({check_attr: "Invalid value for Enumeration."})
+            if data_type == "Integer":
+                valid, msg = self.__validate_integer_registry(check_attr, registry_value, module_input)
+                if not valid:
+                    invalid.update({check_attr: msg})
+        return invalid
+
+    def __get_diff_between_current_and_module_input(self, valid_attr, uri) -> int:
+        diff = 0
+        attributes = self.get_attributes(uri).get('Attributes')
+        for each_attr in valid_attr:
+            if valid_attr[each_attr] != attributes[each_attr]:
+                diff += 1
+        return diff
+
+    def get_valid_invalid_diff(self) -> tuple[dict, dict, int]:
+        network_adapter_id = self.module.params.get('network_adapter_id')
+        network_device_function_id = self.module.params.get('network_device_function_id')
+        oem_network_attributes = self.module.params.get('oem_network_attributes')
+        firm_version = self.__get_idrac_firmware_version()
+        if LooseVersion(firm_version) >= "6.0":
+            uri = OEM_SCHEMA_NETWORK_SETTINGS_FOR_IDRAC_FW_VER_GREATER_AND_EQ_TO_6000000_URI
+        else:
+            uri = OEM_SCHEMA_NETWORK_SETTINGS_FOR_IDRAC_FW_VER_LESSER_TO_6000000_URI
+        uri = uri.format(resource_id=self.resource_id,
+                         network_adapter_id=network_adapter_id,
+                         network_device_function_id=network_device_function_id)
+        get_detailed_attributes = self.get_attributes(uri=uri).get('RegistryEntries',[]).get('Attributes',[])
+        filtered_detailed_attributes = {x["AttributeName"]: x for x in get_detailed_attributes}
+        invalid_attr = {}
+        for each_attr_key in oem_network_attributes:
+            if each_attr_key not in filtered_detailed_attributes:
+                invalid_attr.update({each_attr_key: "Attribute does not exist."})
+            else:
+                invalid_attr.update(self.__validate_with_registry(each_attr_key,
+                                                                  filtered_detailed_attributes,
+                                                                  oem_network_attributes))
+        valid_attr = {key:value for key, value in oem_network_attributes.items() if key not in invalid_attr}
+        uri = OEM_GET_NETWORK_ATTR_URI.format(resource_id=self.resource_id,
+                                              network_adapter_id=network_adapter_id,
+                                              network_device_function_id=network_device_function_id)
+        diff = self.__get_diff_between_current_and_module_input(valid_attr, uri)
+        return valid_attr, invalid_attr, diff
+
     def perform_operation(self):
-        uri = DMTF_GET_PATCH_NETWORK_ATTR_URI.format(resource_id=self.resource_id,
+        
+
+
+class NetworkAttributes(IDRACNetworkAttributes):
+    def __init__(self, idrac, module) -> None:
+        super().__init__(idrac, module)
+        self.perform_validation_for_ids()
+        self.uri = DMTF_GET_PATCH_NETWORK_ATTR_URI.format(resource_id=self.resource_id,
                                                      network_adapter_id=self.module.params.get('network_adapter_id'),
                                                      network_device_function_id=self.module.params.get('network_device_function_id'))
-        result = self.get_attributes_and_validate(uri=uri)
+        
+    def perform_operation(self):
+        result = self.get_attributes(uri=self.uri)
         return result
         
 def get_module_parameters() -> AnsibleModule:
@@ -333,13 +414,20 @@ def get_module_parameters() -> AnsibleModule:
                            supports_check_mode=True)
     return module
 
-
 def main():
     try:
         module = get_module_parameters()
         with iDRACRedfishAPI(module.params, req_session=True) as idrac:
-            result = OEMNetworkAttributes(idrac, module)
-            msg = result.perform_operation()
+            if module.params.get('oem_network_attributes'):
+                network_attr_obj = OEMNetworkAttributes(idrac, module)
+            else:
+                network_attr_obj = NetworkAttributes(idrac, module)
+            valid_attr, invalid_attr, diff = network_attr_obj.get_valid_invalid_diff()
+            if not diff:
+                module.exit_json(msg=NO_CHANGES_FOUND_MSG)
+            elif diff and module.check_mode:
+                module.exit_json(msg=CHANGES_FOUND_MSG, changed=True)
+            msg = network_attr_obj.perform_operation()
             module.exit_json(msg=msg)
     except HTTPError as err:
         module.exit_json(msg=str(err), error_info=json.load(err), failed=True)
