@@ -269,8 +269,7 @@ INVALID_ATTR_MSG = "Unable to update the network attributes because invalid valu
 VALID_AND_INVALID_ATTR_MSG = "Successfully updated the network attributes for valid values. Unable to update other attributes because invalid values are entered. Enter the valid values and retry the operation."
 NO_CHANGES_FOUND_MSG = "No changes found to be applied."
 CHANGES_FOUND_MSG = "Changes found to be applied."
-NETWORK_INVALID_MSG = "{0} is not valid."
-INVALID_RES_ID = "{0} is not valid resource_id."
+INVALID_ID_MSG = "{0} is not valid {1}."
 JOB_RUNNING_CLEAR_PENDING_ATTR = "{0} Config job is running. Wait for the job to complete. Currently can not clear pending attributes."
 
 class IDRACNetworkAttributes:
@@ -295,7 +294,8 @@ class IDRACNetworkAttributes:
                 found = True
                 break
         if not found and res_id_input:
-            self.module.exit_json(msg=INVALID_RES_ID.format(res_id_input), failed=True)
+            self.module.exit_json(failed=True, msg=INVALID_ID_MSG.format(
+                res_id_input, 'resource_id'))
         else:
             res_id_uri = res_id_members[0][odata]
         return res_id_uri
@@ -374,9 +374,11 @@ class IDRACNetworkAttributes:
                     self.network_device_function_id = each_device.get(odata, '')
                     break
             if not found_device:
-                self.module.exit_json(msg=NETWORK_INVALID_MSG.format(network_device_function_id))
+                self.module.exit_json(failed=True, msg=INVALID_ID_MSG.format(network_device_function_id,
+                                                                     'network_device_function_id'))
         else:
-            self.module.exit_json(msg=NETWORK_INVALID_MSG.format(network_adapter_id))
+            self.module.exit_json(failed=True, msg=INVALID_ID_MSG.format(network_adapter_id,
+                                                                 'network_adapter_id'))
 
     def validate_job_timeout(self):
         if self.module.params.get("job_wait") and self.module.params.get("job_wait_timeout") <= 0:
