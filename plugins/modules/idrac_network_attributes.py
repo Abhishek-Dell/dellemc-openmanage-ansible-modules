@@ -482,6 +482,22 @@ def get_module_parameters() -> AnsibleModule:
                            supports_check_mode=True)
     return module
 
+def perform_operation_for_main(module, obj, diff, invalid_attr):
+    if diff:
+        if module.check_mode:
+            module.exit_json(msg=CHANGES_FOUND_MSG, changed=True)
+        else:
+            job_resp, invalid_attr = obj.perform_operation()
+            if job_resp.get('JobState') == "Completed":
+                msg = SUCCESS_MSG if not invalid_attr else VALID_AND_INVALID_ATTR_MSG
+            else:
+                msg = SCHEDULE_MSG
+            module.exit_json(msg=msg, invalid_attributes=invalid_attr,
+                                job_status=job_resp, changed=True)
+    else:
+        module.exit_json(msg=NO_CHANGES_FOUND_MSG, invalid_attributes=invalid_attr) 
+
+
 def main():
     try:
         module = get_module_parameters()
@@ -495,19 +511,7 @@ def main():
             else:
                 base_uri = SYSTEMS_URI
                 network_attr_obj = NetworkAttributes(idrac, module, base_uri) 
-            if diff:
-                if module.check_mode:
-                    module.exit_json(msg=CHANGES_FOUND_MSG, changed=True)
-                else:
-                    job_resp, invalid_attr = network_attr_obj.perform_operation()
-                    if job_resp.get('JobState') == "Completed":
-                        msg = SUCCESS_MSG if not invalid_attr else VALID_AND_INVALID_ATTR_MSG
-                    else:
-                        msg = SCHEDULE_MSG
-                    module.exit_json(msg=msg, invalid_attributes=invalid_attr,
-                                     job_status=job_resp, changed=True)
-            else:
-                module.exit_json(msg=NO_CHANGES_FOUND_MSG, invalid_attributes=invalid_attr) 
+            perform_operation_for_main(module, network_attr_obj, diff, invalid_attr)
     except HTTPError as err:
         module.exit_json(msg=str(err), error_info=json.load(err), failed=True)
     except URLError as err:
