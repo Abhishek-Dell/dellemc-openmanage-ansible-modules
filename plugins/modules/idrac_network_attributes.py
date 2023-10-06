@@ -229,11 +229,13 @@ error_info:
   }
 '''
 
+import re
 import json
 from abc import ABC
 from ansible.module_utils.basic import AnsibleModule
 from ansible_collections.dellemc.openmanage.plugins.module_utils.idrac_redfish import iDRACRedfishAPI, idrac_auth_params
-from ansible_collections.dellemc.openmanage.plugins.module_utils.utils import remove_key, wait_for_idrac_job_completion
+from ansible_collections.dellemc.openmanage.plugins.module_utils.utils import remove_key, wait_for_idrac_job_completion, \
+    get_dynamic_uri, get_scheduled_job_resp, delete_job, get_current_time
 from ansible.module_utils.six.moves.urllib.error import URLError, HTTPError
 from ansible.module_utils.urls import ConnectionError, SSLValidationError
 from ansible.module_utils.compat.version import LooseVersion
@@ -242,8 +244,9 @@ from ansible.module_utils.compat.version import LooseVersion
 SYSTEMS_URI = "/redfish/v1/Systems"
 CHASSIS_URI = "/redfish/v1/Chassis"
 REGISTRY_URI = '/redfish/v1/Registries'
+MANAGERS_URI = '/redfish/v1/Managers'
 GET_ALL_JOBS = "/redfish/v1/JobService/Jobs?$expand=*($levels=1)"
-DELETE_JOB = "/redfish/v1/JobService/Jobs/{job_id}"
+SINGLE_JOB = "/redfish/v1/JobService/Jobs/{job_id}"
 
 GET_NETWORK_ADAPTER_URI = "/redfish/v1/Systems/{resource_id}/NetworkAdapters"
 GET_NETWORK_DEVICE_FUNC_URI = "/redfish/v1/Systems/{resource_id}/NetworkAdapters/{network_adapter_id}/NetworkDeviceFunctions"
@@ -256,9 +259,9 @@ GET_IDRAC_FIRMWARE_VER_URI = "/redfish/v1/Managers/iDRAC.Embedded.1?$select=Firm
 CLEAR_PENDING_URI = "/redfish/v1/Chassis/{resource_id}/NetworkAdapters/{network_adapter_id}/NetworkDeviceFunctions/{network_device_function_id}/Oem/Dell/DellNetworkAttributes/{network_device_function_id}/Settings/Actions/DellManager.ClearPending"
 
 SUCCESS_MSG = "Successfully updated the network attributes."
-PENDING_MSG = "Successfully cleared the pending network attributes."
+SUCCESS_CLEAR_PENDING_ATTR_MSG = "Successfully cleared the pending network attributes."
 SCHEDULE_MSG = "Successfully scheduled the job for network attributes update."
-TIMEOUT_NEGATIVE_OR_ZERO_MSG = "Successfully scheduled the job for network attributes update."
+TIMEOUT_NEGATIVE_OR_ZERO_MSG = "The value for the `job_wait_timeout` parameter cannot be negative or zero."
 MAINTENACE_OFFSET_DIFF_MSG = "The maintenance time must be post-fixed with local offset to <idrac_time_offset>."
 MAINTENACE_OFFSET_BEHIND_MSG = "The specified maintenance time window occurs in the past, provide a future time to schedule the maintenance window."
 APPLY_TIME_NOT_SUPPORTED_MSG = "Apply time <apply_time> is not supported."
@@ -267,26 +270,35 @@ VALID_AND_INVALID_ATTR_MSG = "Successfully updated the network attributes for va
 NO_CHANGES_FOUND_MSG = "No changes found to be applied."
 CHANGES_FOUND_MSG = "Changes found to be applied."
 NETWORK_INVALID_MSG = "{0} is not valid."
-JOB_RUNNING = "NIC Config job is running. Wait for the job to complete. Currently can not clear pending attributes."
+INVALID_RES_ID = "{0} is not valid resource_id."
+JOB_RUNNING_CLEAR_PENDING_ATTR = "{0} Config job is running. Wait for the job to complete. Currently can not clear pending attributes."
 
 class IDRACNetworkAttributes:
 
-    def __init__(self, idrac, module, base_uri, oem=None) -> None:
+    def __init__(self, idrac, module, base_uri) -> None:
         self.module = module
         self.idrac = idrac
         self.base_uri = base_uri
-        self.oem = oem
         self.network_adapter_id_uri = None
         self.network_device_function_id = None
+        self.manager_uri = None
     
     def __get_resource_id(self):
         odata = '@odata.id'
-        res_id = self.module.params.get('resource_id')
-        res_id_members = self.get_dynamic_link(self.base_uri, 'Members')
+        found = False
+        res_id_uri = None
+        res_id_input = self.module.params.get('resource_id')
+        res_id_members = get_dynamic_uri(self.idrac, self.base_uri, 'Members')
         for each in res_id_members:
-            if res_id and res_id in each[odata]:
-                return each[odata]
-        return res_id_members[0][odata]
+            if res_id_input and res_id_input in each[odata]:
+                res_id_uri =  each[odata]
+                found = True
+                break
+        if not found and res_id_input:
+            self.module.exit_json(msg=INVALID_RES_ID.format(res_id_input), failed=True)
+        else:
+            res_id_uri = res_id_members[0][odata]
+        return res_id_uri
     
     def _extract_error_msg(self, resp):
         error_info = {}
@@ -295,15 +307,43 @@ class IDRACNetworkAttributes:
             key = each_dict_err.get('MessageArgs')[0]
             msg = each_dict_err.get('Message')
             if key not in error_info:
-                error_info.update({key: [msg]})
-            else:
-                error_info[key].append(msg)
+                error_info.update({key: msg})
         return error_info
+
+    def __validate_time(self, mtime):
+        curr_time, date_offset = get_current_time(self.idrac)
+        if not mtime.endswith(date_offset):
+            self.module.exit_json(failed=True, msg=MAINTENACE_OFFSET_DIFF_MSG.format(date_offset))
+        if mtime < curr_time:
+            self.module.exit_json(failed=True, msg=MAINTENACE_OFFSET_BEHIND_MSG)
+    
+
+    def __get_redfish_apply_time(self, aplytm, rf_settings):
+        rf_set = {}
+        reboot_req = False
+        if rf_settings:
+            if 'Maintenance' in aplytm:
+                if aplytm not in rf_settings:
+                    self.module.exit_json(failed=True, status_msg=APPLY_TIME_NOT_SUPPORTED_MSG.format(aplytm))
+                else:
+                    rf_set['ApplyTime'] = aplytm
+                    m_win = self.module.params.get('maintenance_window')
+                    self.__validate_time(m_win.get('start_time'))
+                    rf_set['MaintenanceWindowStartTime'] = m_win.get('start_time')
+                    rf_set['MaintenanceWindowDurationInSeconds'] = m_win.get('duration')
+            else:  # assuming OnReset is always
+                if aplytm == "Immediate":
+                    if aplytm not in rf_settings:
+                        reboot_req = True
+                        aplytm = 'OnReset'
+                rf_set['ApplyTime'] = aplytm
+        return rf_set, reboot_req
+
 
     def get_diff_between_current_and_module_input(self, attr, uri) -> tuple[int, dict]:
         diff = 0
         invalid = {}
-        attributes = self.get_dynamic_link(uri).get('Attributes')
+        attributes = get_dynamic_uri(self.idrac, uri).get('Attributes', {})
         for each_attr in attr:
             if each_attr in attributes:
                 if attr[each_attr] != attributes[each_attr]:
@@ -318,123 +358,89 @@ class IDRACNetworkAttributes:
         network_device_function_id = self.module.params.get('network_device_function_id')
         found_adapter, found_device = False, False
         first_resource_id_uri = self.__get_resource_id()
-        network_adapters = self.get_dynamic_link(first_resource_id_uri, 'NetworkAdapters')[odata]
-        network_adapter_list = self.get_dynamic_link(network_adapters, 'Members')
+        network_adapters = get_dynamic_uri(self.idrac, first_resource_id_uri, 'NetworkAdapters')[odata]
+        network_adapter_list = get_dynamic_uri(self.idrac, network_adapters, 'Members')
         for each_adapter in network_adapter_list:
-            if network_adapter_id in each_adapter[odata]:
+            if network_adapter_id in each_adapter.get(odata, ''):
                 found_adapter = True
-                self.network_adapter_id_uri = each_adapter[odata]
+                self.network_adapter_id_uri = each_adapter.get(odata, '')
                 break
         if found_adapter:
-            network_devices = self.get_dynamic_link(self.network_adapter_id_uri, 'NetworkDeviceFunctions')[odata]
-            network_device_list = self.get_dynamic_link(network_devices, 'Members')
+            network_devices = get_dynamic_uri(self.idrac, self.network_adapter_id_uri, 'NetworkDeviceFunctions')[odata]
+            network_device_list = get_dynamic_uri(self.idrac, network_devices, 'Members')
             for each_device in network_device_list:
-                if network_device_function_id in each_device[odata]:
+                if network_device_function_id in each_device.get(odata, ''):
                     found_device = True
-                    self.network_device_function_id = each_device[odata]
+                    self.network_device_function_id = each_device.get(odata, '')
                     break
             if not found_device:
                 self.module.exit_json(msg=NETWORK_INVALID_MSG.format(network_device_function_id))
         else:
             self.module.exit_json(msg=NETWORK_INVALID_MSG.format(network_adapter_id))
 
-    def get_dynamic_link(self, uri, search_label=''):
-        resp = self.idrac.invoke_request(method='GET', uri=uri).json_data
-        if search_label and search_label in resp:
-            return resp[search_label]
-        return resp
+    def validate_job_timeout(self):
+        if self.module.params.get("job_wait") and self.module.params.get("job_wait_timeout") <= 0:
+            self.module.exit_json(msg=TIMEOUT_NEGATIVE_OR_ZERO_MSG, failed=True)
+
+
+    def apply_time(self, setting_uri):
+        resp = get_dynamic_uri(self.idrac, setting_uri, "@Redfish.Settings")
+        rf_settings = resp.get("SupportedApplyTimes", [])
+        apply_time = self.module.params.get('apply_time', {})
+        rf_set, reboot_required = self.__get_redfish_apply_time(apply_time, rf_settings)
+        return rf_set
+
 
 class OEMNetworkAttributes(IDRACNetworkAttributes):
-    def __init__(self, idrac, module, base_uri, oem) -> None:
-        super().__init__(idrac, module, base_uri, oem)
+    def __init__(self, idrac, module, base_uri) -> None:
+        super().__init__(idrac, module, base_uri)
         self.perform_validation_for_ids()
-        self.oem_uri = None
+        self.validate_job_timeout()
+        oem_links = get_dynamic_uri(self.idrac, self.network_device_function_id, 'Links')
+        self.oem_uri = oem_links.get('Oem').get('Dell').get('DellNetworkAttributes').get('@odata.id')
 
     def __get_idrac_firmware_version(self) -> str:
         firm_version = self.idrac.invoke_request(method='GET', uri=GET_IDRAC_FIRMWARE_VER_URI)
         return firm_version.json_data.get('FirmwareVersion', '')
 
-    def __get_scheduled_job_resp(self):
-        job_resp = {}
-        network_device_function_id = self.module.params.get('network_device_function_id')
-        all_jobs = self.idrac.invoke_request(method='GET', uri=GET_ALL_JOBS)
-        for each_job in all_jobs.json_data.get('Members'):
-            if each_job['JobState'] != 'Completed' and network_device_function_id in each_job['Name']:
-                job_resp = each_job
-                break
-        return remove_key(job_resp, regex_pattern='(.*?)@odata') 
 
-    def __delete_scheduled_job(self, job_id):
-        resp = self.idrac.invoke_request(DELETE_JOB.format(job_id=job_id), "DELETE")
-        return resp.json_data
-
-    def clear_pending(self, invalid_attr):
-        resp = self.get_dynamic_link(self.oem_uri, '@Redfish.Settings')
+    def clear_pending(self):
+        resp = get_dynamic_uri(self.idrac, self.oem_uri, '@Redfish.Settings')
         settings_uri = resp.get('SettingsObject').get('@odata.id')
-        settings_uri_resp = self.get_dynamic_link(settings_uri)
+        settings_uri_resp = get_dynamic_uri(self.idrac, settings_uri)
         pending_attributes = settings_uri_resp.get('Attributes')
+        clear_pending_uri = settings_uri_resp.get('Actions').get('#DellManager.ClearPending').get('target')
         if not pending_attributes:
-            self.module.exit_json(msg=NO_CHANGES_FOUND_MSG, invalid_attributes=invalid_attr)
-    
-        job_resp = self.__get_scheduled_job_resp()
+            self.module.exit_json(msg=NO_CHANGES_FOUND_MSG)
+        job_resp = get_scheduled_job_resp(self.idrac, 'NICConfiguration')
         job_id, job_state = job_resp.get('Id'), job_resp.get('JobState')
         if job_id:
             if job_state in ["Running"]:
-                self.module.exit_json(failed=True, msg=JOB_RUNNING, job_status=job_resp)
+                job_resp = remove_key(job_resp, regex_pattern='(.*?)@odata') 
+                self.module.exit_json(failed=True, msg=JOB_RUNNING_CLEAR_PENDING_ATTR,
+                                      job_status=job_resp)
             elif job_state in ["Starting", "Scheduled", "Scheduling"]:
                 if self.module.check_mode:
                     self.module.exit_json(msg=CHANGES_FOUND_MSG, changed=True)
-                self.__delete_scheduled_job(job_id)
-                self.module.exit_json(msg=PENDING_MSG, changed=True, invalid_attributes=invalid_attr)
+                delete_job(self.idrac, job_id)
+                self.module.exit_json(msg=SUCCESS_CLEAR_PENDING_ATTR_MSG, changed=True)
         if self.module.check_mode:
-            self.module.exit_json(msg=CHANGES_FOUND_MSG, changed=True, invalid_attributes=invalid_attr)
-        clear_pending_uri = settings_uri_resp.get('Actions').get('#DellManager.ClearPending').get('target')
+            self.module.exit_json(msg=CHANGES_FOUND_MSG, changed=True)
         self.idrac.invoke_request(clear_pending_uri, "POST", data="{}", dump=False)
-        self.module.exit_json(msg=PENDING_MSG, changed=True, invalid_attributes=invalid_attr)
+        self.module.exit_json(msg=SUCCESS_CLEAR_PENDING_ATTR_MSG, changed=True)
 
-    # def get_valid_invalid_diff_idrac9(self) -> tuple[dict, dict, int]:
-    #     network_adapter_id = self.module.params.get('network_adapter_id')
-    #     network_device_function_id = self.module.params.get('network_device_function_id')
-    #     oem_network_attributes = self.module.params.get('oem_network_attributes')
-    #     firm_version = self.__get_idrac_firmware_version()    
-    #     if LooseVersion(firm_version) >= "6.0": # Checking for idrac 9 with firmware >= 6.0
-    #         uri = self.__get_oem_registry_schema()
-    #     location = self.get_dynamic_link(uri).get('Location')
-    #     if location:
-    #         uri = location[0].get('Uri')
-    #     get_detailed_attributes = self.get_dynamic_link(uri).get('RegistryEntries',[]).get('Attributes',[])
-    #     filtered_detailed_attributes = {x["AttributeName"]: x for x in get_detailed_attributes}
-    #     invalid_attr = {}
-    #     for each_attr_key in oem_network_attributes:
-    #         if each_attr_key not in filtered_detailed_attributes:
-    #             invalid_attr.update({each_attr_key: "Attribute does not exist."})
-    #         else:
-    #             invalid_attr.update(self.__validate_with_registry(each_attr_key,
-    #                                                             filtered_detailed_attributes,
-    #                                                             oem_network_attributes))
-    #     valid_attr = {key:value for key, value in oem_network_attributes.items() if key not in invalid_attr}
-    #     uri = OEM_GET_NETWORK_ATTR_URI.format(resource_id=self.resource_id,
-    #                                         network_adapter_id=network_adapter_id,
-    #                                         network_device_function_id=network_device_function_id)
-    #     diff = self.get_diff_between_current_and_module_input(valid_attr, uri)
-    #     return valid_attr, invalid_attr, diff
-
-    def get_diff_for_oem(self) -> tuple[int, dict]:
-        oem_network_attributes = self.module.params.get('oem_network_attributes')
-        oem = self.get_dynamic_link(self.network_device_function_id, 'Links')
-        self.oem_uri = oem.get('Oem').get('Dell').get('DellNetworkAttributes').get('@odata.id')
-        diff, invalid = self.get_diff_between_current_and_module_input(oem_network_attributes, self.oem_uri)
-        return diff, invalid
 
     def perform_operation(self):
         oem_network_attributes = self.module.params.get('oem_network_attributes')
         job_wait = self.module.params.get('job_wait')
         job_wait_timeout = self.module.params.get('job_wait_timeout')
-        patch_uri = self.get_dynamic_link(self.oem_uri).get('@Redfish.Settings').get('SettingsObject').get('@odata.id')
-        payload = {"@Redfish.SettingsApplyTime": {
-            "ApplyTime": "Immediate"
-        }, 'Attributes': oem_network_attributes}
-        response = self.idrac.invoke_request(method='PATCH', uri=patch_uri, data=payload)        
+        payload = {'Attributes': oem_network_attributes}
+        apply_time_setting = self.apply_time(self.oem_uri)
+        if apply_time_setting:
+            payload.update({"@Redfish.SettingsApplyTime": apply_time_setting})
+
+        patch_uri = get_dynamic_uri(self.idrac, self.oem_uri).get('@Redfish.Settings', {}).get('SettingsObject', {}).get('@odata.id')
+        response = self.idrac.invoke_request(method='PATCH', uri=patch_uri, data=payload)
         invalid_attr = self._extract_error_msg(response)
         job_tracking_uri = response.headers["Location"]
         job_resp, error_msg = wait_for_idrac_job_completion(self.idrac, job_tracking_uri,
@@ -446,10 +452,13 @@ class OEMNetworkAttributes(IDRACNetworkAttributes):
         job_resp = remove_key(job_resp.json_data, regex_pattern='(.*?)@odata')
         return job_resp, invalid_attr
 
+
 class NetworkAttributes(IDRACNetworkAttributes):
-    def __init__(self, idrac, module, base_uri, oem) -> None:
-        super().__init__(idrac, module, base_uri, oem)
+    def __init__(self, idrac, module, base_uri) -> None:
+        super().__init__(idrac, module, base_uri)
         self.perform_validation_for_ids()
+        self.validate_job_timeout()
+
 
 def get_module_parameters() -> AnsibleModule:
     specs = {
@@ -459,7 +468,7 @@ def get_module_parameters() -> AnsibleModule:
         "oem_network_attributes": {"type": 'dict'},
         "resource_id": {"type": 'str'},
         "clear_pending": {"type": 'bool', "default": False},
-        "apply_time": {"type": 'str', "default": 'Immediate',
+        "apply_time": {"type": 'str', "required": True,
                        "choices": ['Immediate', 'OnReset', 'AtMaintenanceWindowStart', 'InMaintenanceWindowOnReset']},
         "maintenance_window": {"type": 'dict',
                                "options": {"start_time": {"type": 'str', "required": True},
@@ -469,8 +478,7 @@ def get_module_parameters() -> AnsibleModule:
     }
     specs.update(idrac_auth_params)
     module = AnsibleModule(argument_spec=specs,
-                        #    mutually_exclusive=[('network_attributes', 'oem_network_attributes')],
-                        #    required_one_of=[('network_attributes', 'oem_network_attributes')],
+                           mutually_exclusive=[('network_attributes', 'oem_network_attributes')],
                            supports_check_mode=True)
     return module
 
@@ -478,15 +486,15 @@ def main():
     try:
         module = get_module_parameters()
         with iDRACRedfishAPI(module.params, req_session=True) as idrac:
-            if module.params.get('oem_network_attributes'):
-                base_uri, oem = CHASSIS_URI, True
-                network_attr_obj = OEMNetworkAttributes(idrac, module, base_uri, oem)
-                diff, invalid_attr = network_attr_obj.get_diff_for_oem()
+            if oem_attribute:= module.params.get('oem_network_attributes') or module.params.get('clear_pending'):
+                base_uri = CHASSIS_URI
+                network_attr_obj = OEMNetworkAttributes(idrac, module, base_uri)
                 if module.params.get('clear_pending'):
-                    network_attr_obj.clear_pending(invalid_attr)
+                    network_attr_obj.clear_pending()
+                diff, invalid_attr = network_attr_obj.get_diff_between_current_and_module_input(oem_attribute, network_attr_obj.oem_uri)
             else:
-                base_uri, oem = SYSTEMS_URI, False
-                network_attr_obj = NetworkAttributes(idrac, module, base_uri, oem) 
+                base_uri = SYSTEMS_URI
+                network_attr_obj = NetworkAttributes(idrac, module, base_uri) 
             if diff:
                 if module.check_mode:
                     module.exit_json(msg=CHANGES_FOUND_MSG, changed=True)
