@@ -8,7 +8,7 @@
         idrac_ip: "{{ lookup('env', 'IDRAC_IP') }}"
         idrac_user: "{{ lookup('env', 'IDRAC_USERNAME') }}"
         idrac_password: "{{ lookup('env', 'IDRAC_PASSWORD') }}"
-        validate_certs: "{{ lookup('env', 'VALIDATE_CERT') }}"
+        validate_certs: false
         scp_components:
           - IDRAC
         share_name: "/root/"
